@@ -5,24 +5,16 @@ module top #(
     parameter int unsigned CLK_HZ = 50_000_000,
     parameter int unsigned I2C_HZ = 100_000
 )(
-    input  wire CLK,
+    input  wire       CLK,
     input  wire [3:0] KEY_SW,
-
     output logic [3:0] LED,
-
-    inout  wire i2c_scl,
-    inout  wire i2c_sda
+    inout  wire       i2c_scl,
+    inout  wire       i2c_sda
 );
 
-    // ===============================
-    // RESET
-    // ===============================
     wire clk   = CLK;
     wire rst_n = KEY_SW[3];
 
-    // ===============================
-    // I2C master interface
-    // ===============================
     logic        start;
     logic        is_read;
     logic [6:0]  dev_addr;
@@ -42,9 +34,6 @@ module top #(
     assign i2c_scl = scl_drive_low ? 1'b0 : 1'bz;
     assign i2c_sda = sda_drive_low ? 1'b0 : 1'bz;
 
-    // ===============================
-    // I2C master
-    // ===============================
     i2c_master #(
         .CLK_HZ(CLK_HZ),
         .I2C_HZ(I2C_HZ)
@@ -69,121 +58,143 @@ module top #(
         .sda_in        (i2c_sda)
     );
 
-    // ===============================
-    // FSM управления моторами
-    // ===============================
-
     localparam [6:0] ROVER_ADDR = 7'h38;
-    localparam signed [7:0] SPEED = 8'd60; // скорость вперёд
+    localparam [7:0] SPEED_FWD  = 8'd70;
 
     typedef enum logic [3:0] {
-        IDLE,
-        WAIT_POWER,
-        M1_START, M1_WAIT,
-        M2_START, M2_WAIT,
-        M3_START, M3_WAIT,
-        M4_START, M4_WAIT,
-        DONE
+        ST_PWRUP_WAIT,
+        ST_M1_START, ST_M1_WAIT,
+        ST_M2_START, ST_M2_WAIT,
+        ST_M3_START, ST_M3_WAIT,
+        ST_M4_START, ST_M4_WAIT,
+        ST_GAP
     } state_t;
 
     state_t state;
 
-    // задержка после старта (~0.1 сек)
-    logic [22:0] delay_cnt;
+    logic [24:0] wait_cnt;
+    logic        err_latched;
+    logic        nack_latched;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state       <= IDLE;
-            delay_cnt   <= 0;
+            state         <= ST_PWRUP_WAIT;
+            wait_cnt      <= '0;
+            err_latched   <= 1'b0;
+            nack_latched  <= 1'b0;
 
-            start       <= 0;
-            is_read     <= 0;
-            dev_addr    <= 0;
-            reg_addr    <= 0;
-            reg_addr_16b<= 0;
-            wr_data     <= 0;
-            rd_len      <= 0;
+            start         <= 1'b0;
+            is_read       <= 1'b0;
+            dev_addr      <= ROVER_ADDR;
+            reg_addr      <= 16'h0000;
+            reg_addr_16b  <= 1'b0;
+            wr_data       <= 8'h00;
+            rd_len        <= 2'd0;
         end else begin
-            start <= 0;
+            start <= 1'b0;
+
+            if (error)
+                err_latched <= 1'b1;
+            if (nack)
+                nack_latched <= 1'b1;
 
             case (state)
-
-                // -------------------
-                IDLE:
-                    state <= WAIT_POWER;
-
-                // -------------------
-                WAIT_POWER:
-                    if (delay_cnt < CLK_HZ / 10) begin
-                        delay_cnt <= delay_cnt + 1;
+                ST_PWRUP_WAIT: begin
+                    if (wait_cnt < CLK_HZ/5) begin
+                        wait_cnt <= wait_cnt + 1'b1; // ~200 ms
                     end else begin
-                        state <= M1_START;
+                        wait_cnt <= '0;
+                        state    <= ST_M1_START;
                     end
-
-                // ===================
-                // MOTOR 1
-                M1_START: begin
-                    dev_addr <= ROVER_ADDR;
-                    reg_addr <= 8'h00;
-                    wr_data  <= SPEED;
-                    is_read  <= 0;
-
-                    start <= 1;
-                    state <= M1_WAIT;
                 end
 
-                M1_WAIT:
-                    if (done) state <= M2_START;
-
-                // ===================
-                // MOTOR 2
-                M2_START: begin
-                    reg_addr <= 8'h01;
-                    start <= 1;
-                    state <= M2_WAIT;
+                ST_M1_START: begin
+                    dev_addr     <= ROVER_ADDR;
+                    reg_addr     <= 16'h0000;
+                    reg_addr_16b <= 1'b0;
+                    wr_data      <= SPEED_FWD;
+                    is_read      <= 1'b0;
+                    rd_len       <= 2'd0;
+                    start        <= 1'b1;
+                    state        <= ST_M1_WAIT;
                 end
 
-                M2_WAIT:
-                    if (done) state <= M3_START;
-
-                // ===================
-                // MOTOR 3
-                M3_START: begin
-                    reg_addr <= 8'h02;
-                    start <= 1;
-                    state <= M3_WAIT;
+                ST_M1_WAIT: begin
+                    if (done) begin
+                        state <= ST_M2_START;
+                    end else if (error || nack) begin
+                        state <= ST_GAP;
+                    end
                 end
 
-                M3_WAIT:
-                    if (done) state <= M4_START;
-
-                // ===================
-                // MOTOR 4
-                M4_START: begin
-                    reg_addr <= 8'h03;
-                    start <= 1;
-                    state <= M4_WAIT;
+                ST_M2_START: begin
+                    reg_addr <= 16'h0001;
+                    wr_data  <= SPEED_FWD;
+                    start    <= 1'b1;
+                    state    <= ST_M2_WAIT;
                 end
 
-                M4_WAIT:
-                    if (done) state <= DONE;
+                ST_M2_WAIT: begin
+                    if (done) begin
+                        state <= ST_M3_START;
+                    end else if (error || nack) begin
+                        state <= ST_GAP;
+                    end
+                end
 
-                // -------------------
-                DONE:
-                    state <= DONE;
+                ST_M3_START: begin
+                    reg_addr <= 16'h0002;
+                    wr_data  <= SPEED_FWD;
+                    start    <= 1'b1;
+                    state    <= ST_M3_WAIT;
+                end
 
+                ST_M3_WAIT: begin
+                    if (done) begin
+                        state <= ST_M4_START;
+                    end else if (error || nack) begin
+                        state <= ST_GAP;
+                    end
+                end
+
+                ST_M4_START: begin
+                    reg_addr <= 16'h0003;
+                    wr_data  <= SPEED_FWD;
+                    start    <= 1'b1;
+                    state    <= ST_M4_WAIT;
+                end
+
+                ST_M4_WAIT: begin
+                    if (done) begin
+                        wait_cnt <= '0;
+                        state    <= ST_GAP;
+                    end else if (error || nack) begin
+                        wait_cnt <= '0;
+                        state    <= ST_GAP;
+                    end
+                end
+
+                ST_GAP: begin
+                    if (wait_cnt < CLK_HZ/20) begin
+                        wait_cnt <= wait_cnt + 1'b1; // ~50 ms
+                    end else begin
+                        wait_cnt <= '0;
+                        state    <= ST_M1_START;
+                    end
+                end
+
+                default: begin
+                    state <= ST_PWRUP_WAIT;
+                end
             endcase
         end
     end
 
-    // ===============================
-    // LED индикация
-    // ===============================
     always_comb begin
-        LED[0] = busy;
-        LED[1] = done;
-        LED[2] = error | nack;
-        LED[3] = (state == DONE);
+        LED[0] = busy;                         // I2C занят
+        LED[1] = (state != ST_PWRUP_WAIT);     // FSM активна
+        LED[2] = err_latched | nack_latched;   // была ошибка/NACK
+        LED[3] = (state == ST_GAP);            // цикл команд завершён
     end
 
 endmodule
