@@ -1,0 +1,11 @@
+module top(
+	input 	logic CLK;
+	input 	logic RESET;
+	output 	logic[3:0] LED;
+	output 	logic[7:0] SEG;
+	output 	logic[3:0] DIG;
+)
+
+assign LED = 4'b0;
+assign SEG = 8'h01;
+assign DIG = 4'b1100;
